@@ -1,0 +1,76 @@
+**Step 1: Mechanical Assembly & Wiring**
+
+* Lay out all 3D printed parts, hardware, and electronics.
+* Assemble the frame and mechanical components as shown in the CAD model.
+* Complete all wiring *before* attaching the bottom enclosure lid, then secure the lid once verified.
+
+**Wiring Connections**
+
+* **Power Distribution**
+* **Pico W:** Powered directly via USB cable from the 5V Power Bank.
+* **Power (+):** Positive battery lead → L298N 12V terminals and PCA9685 V+ screw terminal.
+* **Common Ground (-):** Negative battery lead → L298N GND, PCA9685 GND, and a Pico GND pin.
+
+
+* **Pico W to PCA9685 Servo Driver (I2C)**
+* **3V3 (Pin 36)** → PCA9685 VCC
+* **GND (Pin 38)** → PCA9685 GND
+* **GP0 (Pin 1)** → PCA9685 SDA
+* **GP1 (Pin 2)** → PCA9685 SCL
+
+
+* **Pico W to L298N Motor Drivers**
+* **Driver 1 (Left Motors):** GP2 → IN1 | GP3 → IN2 (Left Front) | GP4 → IN3 | GP5 → IN4 (Left Rear)
+* **Driver 2 (Right Motors):** GP6 → IN1 | GP7 → IN2 (Right Front) | GP8 → IN3 | GP9 → IN4 (Right Rear)
+
+
+* **Outputs**
+* **TT Motors:** Connect motor leads directly to L298N OUT1/OUT2 and OUT3/OUT4 terminals.
+* **Servos:** Channel 0 → 20kg DS Servo #1 | Channel 1 → 20kg DS Servo #2 | Channel 2 → MG90 Micro Servo
+
+
+* **Wire Management**
+* Bundle and route all cables away from moving gears and intake mechanisms using zip ties or clips.
+
+
+
+---
+
+**Step 2: Software & Controller Setup**
+
+1. Connect the Pico W to your computer (Windows or Mac) and open **Thonny IDE**.
+2. Paste your project code into the editor.
+3. Update the Wi-Fi credentials in the script to match your local network name and password.
+4. Click **File > Save As...**, select **Raspberry Pi Pico**, and name the file `main.py`.
+5. Connect your wired gamepad (e.g., Logitech F310) to the computer.
+6. Run the code in Thonny, look at the shell terminal output, and open the web address link displayed.
+7. Turn on the main power switch to the robot, verify the connection in your browser, and begin operation.
+
+---
+
+**Step 3: Code Adjustments**
+
+* **Servo Angles:** Edit the angle preset variables near the top of `main.py` to fine-tune physical positions.
+* **Mecanum Drive / Strafing:** Set the drive mode flag at the top of the code to `True` if using Mecanum wheels to enable strafing, or `False` for standard drive wheels.
+
+---
+
+**Step 4: Controls Guide**
+
+**Drivetrain (Robot-Centric)**
+
+* **Left Joystick (Y-Axis):** Drive Forward / Backward
+* **Left Joystick (X-Axis):** Strafe Left / Right
+* **Right Joystick (X-Axis):** Turn Left / Right
+
+**Intake & Collection**
+
+* **Right Trigger (RT):** Move arm/elevator to Intake Position
+* **Left Trigger (LT):** Run intake to collect game piece
+
+**Reef Scoring Presets**
+
+* **Y Button:** Level 4 (L4)
+* **B Button:** Level 3 (L3)
+* **X Button:** Level 2 (L2)
+* **A Button:** Level 1 (L1 - *Untuned*)
