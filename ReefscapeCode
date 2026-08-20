@@ -1,0 +1,521 @@
+import network
+import uasyncio as asyncio
+import time
+import ustruct
+import gc
+import hashlib
+import ubinascii
+from machine import Pin, PWM, I2C
+
+# ==========================================
+# 1. WI-FI CREDENTIALS
+# ==========================================
+WIFI_SSID = "Outdoor"
+WIFI_PASS = "zayan123"
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(WIFI_SSID, WIFI_PASS)
+
+print("Connecting to Wi-Fi...")
+while not wlan.isconnected():
+    time.sleep(0.5)
+
+wlan.config(pm=0xa11140)  # Disable Wi-Fi power saving
+
+pico_ip = wlan.ifconfig()[0]
+print(f"\n" + "="*50)
+print(f"SUCCESS! Open your browser and go to:")
+print(f"  http://{pico_ip}")
+print("="*50 + "\n")
+
+# ==========================================
+# 2. SERVO & MOTOR SETUP
+# ==========================================
+ENABLE_TURNING = False  # Set to False to disable turning, True to enable turning
+
+MOTOR_SPEED = 65535
+SERVO_CHANNELS = [0, 8, 2]
+
+SERVO_POSITIONS = {
+    '1':   [75,  180, 0,   0.3],   # X Button
+    '2':   [85,  170, 70,  1.0],   # A Button (1st Click)
+    '22':  [85,  170, 145, 0.7],   # A Button (2nd Click Step 1)
+    '3':   [101, 173, 48,  1.0],   # B Button (1st Click)
+    '33':  [98,  173, 130, 0.7],   # B Button (2nd Click Step 1)
+    '4':   [98, 135, 120, 1.0],   # Y Button (1st Click)
+    '44':  [110, 155, 90,  0.7],   # Y Button (2nd Click Step 1)
+    'i':   [58,  176, 155, 0.7],   # RT
+    'ii':  [50,  176, 158, 1.0],   # LT
+    '5':   [118, 165, 90,  1.0]    # Rest position
+}
+
+current_angles = [115, 155, 90]
+
+class PCA9685:
+    def __init__(self, i2c, address=0x40):
+        self.i2c = i2c
+        self.address = address
+        self.reset()
+
+    def _write(self, reg, val):
+        try:
+            self.i2c.writeto_mem(self.address, reg, bytearray([val]))
+        except Exception as e:
+            print("[I2C Write Error]", e)
+
+    def _read(self, reg):
+        try:
+            return self.i2c.readfrom_mem(self.address, reg, 1)[0]
+        except Exception as e:
+            print("[I2C Read Error]", e)
+            return 0
+
+    def reset(self):
+        self._write(0x00, 0x00)
+        time.sleep_ms(10)
+
+    def freq(self, freq=None):
+        if freq is None:
+            return int(25000000 / (4096 * (self._read(0xFE) + 1)))
+        prescale = int(25000000.0 / (4096.0 * freq) - 0.5)
+        oldmode = self._read(0x00)
+        newmode = (oldmode & 0x7F) | 0x10
+        self._write(0x00, newmode)
+        self._write(0xFE, prescale)
+        self._write(0x00, oldmode)
+        time.sleep_ms(5)
+        self._write(0x00, oldmode | 0xA1)
+
+    def duty(self, index, value=None):
+        value = min(4095, max(0, value))
+        data = ustruct.pack('<HH', 0, value)
+        try:
+            self.i2c.writeto_mem(self.address, 0x06 + 4 * index, data)
+        except Exception as e:
+            print("[I2C Duty Error]", e)
+
+# 4 Independent Motor Channels (Front Left, Rear Left, Front Right, Rear Right)
+fl_pwm = PWM(Pin(10)); fl_in1 = Pin(11, Pin.OUT); fl_in2 = Pin(12, Pin.OUT)
+rl_pwm = PWM(Pin(15)); rl_in1 = Pin(13, Pin.OUT); rl_in2 = Pin(14, Pin.OUT)
+fr_pwm = PWM(Pin(16)); fr_in1 = Pin(19, Pin.OUT); fr_in2 = Pin(20, Pin.OUT)
+rr_pwm = PWM(Pin(21)); rr_in1 = Pin(17, Pin.OUT); rr_in2 = Pin(18, Pin.OUT)
+
+for pwm in [fl_pwm, rl_pwm, fr_pwm, rr_pwm]: 
+    pwm.freq(1000)
+
+i2c = I2C(0, sda=Pin(4), scl=Pin(5), freq=100000)
+pca = PCA9685(i2c, address=0x40)
+pca.freq(50)
+
+def set_servo_angle(channel, angle):
+    duty = int(102 + (angle / 180.0) * (512 - 102))
+    pca.duty(channel, duty)
+
+async def apply_position(pos):
+    global current_angles
+    if pos in SERVO_POSITIONS:
+        data = SERVO_POSITIONS[pos]
+        target_angles = data[0:3]
+        speed = max(0.01, min(1.0, data[3]))
+
+        step_delay_ms = int((1.0 - speed) * 15)
+        max_diff = max(abs(target_angles[i] - current_angles[i]) for i in range(3))
+        
+        if max_diff == 0 or speed == 1.0:
+            for idx, ch in enumerate(SERVO_CHANNELS):
+                set_servo_angle(ch, target_angles[idx])
+                current_angles[idx] = target_angles[idx]
+        else:
+            steps = max_diff
+            for step in range(1, steps + 1):
+                for idx, ch in enumerate(SERVO_CHANNELS):
+                    start = current_angles[idx]
+                    target = target_angles[idx]
+                    current = start + (target - start) * (step / steps)
+                    set_servo_angle(ch, current)
+                
+                if step_delay_ms > 0:
+                    await asyncio.sleep_ms(step_delay_ms)
+            
+            current_angles = list(target_angles)
+            
+        print(f"[SERVO] Position {pos} applied")
+
+def stop_motors():
+    fl_pwm.duty_u16(0); rl_pwm.duty_u16(0)
+    fr_pwm.duty_u16(0); rr_pwm.duty_u16(0)
+    fl_in1.value(0); fl_in2.value(0)
+    rl_in1.value(0); rl_in2.value(0)
+    fr_in1.value(0); fr_in2.value(0)
+    rr_in1.value(0); rr_in2.value(0)
+
+last_drive_packet = 0
+motor_is_running = False
+
+def apply_mecanum_drive(strafe_x, drive_y, turn_x):
+    global last_drive_packet, motor_is_running
+    last_drive_packet = time.ticks_ms()
+
+    # Disable turning if flag is set to False
+    if not ENABLE_TURNING:
+        turn_x = 0
+
+    if strafe_x == 0 and drive_y == 0 and turn_x == 0:
+        stop_motors()
+        motor_is_running = False
+        return
+
+    motor_is_running = True
+
+    # Mecanum wheel vector mixing equations (strafe_x inverted for rear wheels)
+    fl_speed = drive_y + strafe_x + turn_x
+    rl_speed = drive_y + strafe_x - turn_x  # Inverted strafe_x sign
+    fr_speed = drive_y - strafe_x - turn_x
+    rr_speed = drive_y - strafe_x + turn_x  # Inverted strafe_x sign
+
+    # Clamp values between -100 and 100
+    fl_speed = max(-100, min(100, fl_speed))
+    rl_speed = max(-100, min(100, rl_speed))
+    fr_speed = max(-100, min(100, fr_speed))
+    rr_speed = max(-100, min(100, rr_speed))
+
+    # Convert speeds (-100 to 100) to 16-bit PWM duty cycles
+    fl_duty = int((abs(fl_speed) / 100.0) * MOTOR_SPEED)
+    rl_duty = int((abs(rl_speed) / 100.0) * MOTOR_SPEED)
+    fr_duty = int((abs(fr_speed) / 100.0) * MOTOR_SPEED)
+    rr_duty = int((abs(rr_speed) / 100.0) * MOTOR_SPEED)
+
+    fl_pwm.duty_u16(fl_duty); rl_pwm.duty_u16(rl_duty)
+    fr_pwm.duty_u16(fr_duty); rr_pwm.duty_u16(rr_duty)
+
+    # Set motor directions
+    fl_in1.value(1 if fl_speed > 0 else 0); fl_in2.value(1 if fl_speed < 0 else 0)
+    rl_in1.value(1 if rl_speed < 0 else 0); rl_in2.value(1 if rl_speed > 0 else 0)
+    fr_in1.value(1 if fr_speed > 0 else 0); fr_in2.value(1 if fr_speed < 0 else 0)
+    rr_in1.value(1 if rr_speed < 0 else 0); rr_in2.value(1 if rr_speed > 0 else 0)
+
+# Initial servo position
+set_servo_angle(0, 100)
+set_servo_angle(8, 155)
+set_servo_angle(2, 90)
+
+# ==========================================
+# 3. WEBSOCKET HELPERS
+# ==========================================
+WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+def generate_ws_handshake(sec_key):
+    combined = sec_key.strip() + WS_MAGIC
+    sha1_hash = hashlib.sha1(combined.encode('utf-8')).digest()
+    accept_key = ubinascii.b2a_base64(sha1_hash).decode('utf-8').strip()
+    return (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+    )
+
+async def read_ws_message(reader):
+    try:
+        header = await reader.read(2)
+        if not header or len(header) < 2:
+            return None
+            
+        payload_len = header[1] & 127
+        is_masked = bool(header[1] & 128)
+        
+        if payload_len == 126:
+            ext_len = await reader.read(2)
+            payload_len = int.from_bytes(ext_len, 'big')
+            
+        masks = await reader.read(4) if is_masked else None
+        data = await reader.read(payload_len)
+        
+        if is_masked and masks:
+            data = bytearray(b ^ masks[i % 4] for i, b in enumerate(data))
+            
+        return data
+    except Exception:
+        return None
+
+# ==========================================
+# 4. HTML & JS FRONTEND INTERFACE
+# ==========================================
+HTML_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Pico WebSocket Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; background: #181818; color: #fff; margin-top: 20px; }
+        .card { background: #282828; display: inline-block; padding: 25px; border-radius: 12px; max-width: 500px; width: 90%; }
+        .status { font-size: 1.1rem; color: #00ff88; margin-top: 15px; font-weight: bold; }
+        .debug { font-size: 0.9rem; color: #ffcc00; margin-top: 10px; font-family: monospace; }
+        .btn-group button { font-size: 1rem; padding: 12px; margin: 4px; background: #3a3a3a; color: white; border: 1px solid #555; border-radius: 6px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>Pico Mecanum Controller</h2>
+        <div id="status" class="status">Connecting WebSocket...</div>
+        <div id="debug" class="debug">State: Idle</div>
+        <br>
+        <div class="btn-group">
+            <button onclick="sendByte(1)">Pos 1 (X)</button>
+            <button onclick="sendByte(2)">Pos 2 (A)</button>
+            <button onclick="sendByte(22)">Pos 22</button>
+            <button onclick="sendByte(3)">Pos 3 (B)</button>
+            <button onclick="sendByte(33)">Pos 33</button>
+            <button onclick="sendByte(4)">Pos 4 (Y)</button>
+            <button onclick="sendByte(44)">Pos 44</button>
+            <button onclick="sendByte(105)">Pos i (RT)</button>
+            <button onclick="sendByte(106)">Pos ii (LT)</button>
+            <button onclick="sendByte(5)">Pos 5 (Release)</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let lastPosSent = 5;
+        let lastDriveSend = 0;
+        let isTransitioning = false;
+
+        let aToggle = false;
+        let bToggle = false;
+        let yToggle = false;
+
+        let aPressedLastFrame = false;
+        let bPressedLastFrame = false;
+        let yPressedLastFrame = false;
+
+        function initWebSocket() {
+            let protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            ws = new WebSocket(protocol + window.location.host + '/ws');
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                document.getElementById("status").innerText = "WebSocket Connected";
+            };
+
+            ws.onclose = () => {
+                document.getElementById("status").innerText = "Disconnected. Reconnecting...";
+                setTimeout(initWebSocket, 1000);
+            };
+        }
+
+        function sendByte(cmdByte) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(new Uint8Array([cmdByte]));
+            }
+        }
+
+        function sendCommand(posByte, force = false) {
+            if ((lastPosSent !== posByte || force) && !isTransitioning) {
+                lastPosSent = posByte;
+                sendByte(posByte);
+            }
+        }
+
+        function triggerStepSequence(stepByte, delayMs = 800) {
+            if (isTransitioning) return;
+            isTransitioning = true;
+            lastPosSent = stepByte;
+            sendByte(stepByte);
+            
+            setTimeout(() => {
+                lastPosSent = 5;
+                sendByte(5);
+                isTransitioning = false;
+            }, delayMs);
+        }
+
+        function sendJoystickState(strafeX, driveY, turnX) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+            const cStrafe = Math.max(-100, Math.min(100, Math.round(strafeX)));
+            const cDrive = Math.max(-100, Math.min(100, Math.round(driveY)));
+            const cTurn = Math.max(-100, Math.min(100, Math.round(turnX)));
+
+            // 4-byte packet: [Header 0x01, Strafe_X, Drive_Y, Turn_X]
+            const buffer = new ArrayBuffer(4);
+            const view = new DataView(buffer);
+            view.setUint8(0, 0x01);     // Drive Header
+            view.setInt8(1, cStrafe);   // Strafe Right/Left
+            view.setInt8(2, cDrive);    // Forward/Backward
+            view.setInt8(3, cTurn);     // Turn Right/Left
+            ws.send(buffer);
+        }
+
+        window.addEventListener("gamepadconnected", (e) => {
+            document.getElementById("status").innerText = "Connected: " + e.gamepad.id;
+        });
+
+        function checkGamepad() {
+            const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+            let gp = null;
+
+            for (let i = 0; i < gps.length; i++) {
+                if (gps[i]) { gp = gps[i]; break; }
+            }
+
+            if (gp) {
+                let pressed = [];
+                gp.buttons.forEach((b, idx) => {
+                    if (b.pressed || b.value > 0.5) pressed.push(idx);
+                });
+
+                let isAPressed = pressed.includes(0);
+                let isBPressed = pressed.includes(1);
+                let isYPressed = pressed.includes(3);
+
+                // --- A BUTTON TOGGLE LOGIC ---
+                if (isAPressed && !aPressedLastFrame && !isTransitioning) {
+                    if (!aToggle) { aToggle = true; sendCommand(2, true); } 
+                    else { aToggle = false; triggerStepSequence(22, 800); }
+                }
+                aPressedLastFrame = isAPressed;
+
+                // --- B BUTTON TOGGLE LOGIC ---
+                if (isBPressed && !bPressedLastFrame && !isTransitioning) {
+                    if (!bToggle) { bToggle = true; sendCommand(3, true); } 
+                    else { bToggle = false; triggerStepSequence(33, 800); }
+                }
+                bPressedLastFrame = isBPressed;
+
+                // --- Y BUTTON TOGGLE LOGIC ---
+                if (isYPressed && !yPressedLastFrame && !isTransitioning) {
+                    if (!yToggle) { yToggle = true; sendCommand(4, true); } 
+                    else { yToggle = false; triggerStepSequence(44, 800); }
+                }
+                yPressedLastFrame = isYPressed;
+
+                // --- SINGLE PRESS BUTTONS (X, RT, LT) ---
+                if (!isTransitioning && !isAPressed && !isBPressed && !isYPressed) {
+                    if (pressed.includes(7)) { sendCommand(105); }      // RT
+                    else if (pressed.includes(6)) { sendCommand(106); } // LT
+                    else if (pressed.includes(2)) { sendCommand(1); }   // X
+                }
+
+                // --- ANALOG JOYSTICK MAPPING ---
+                // Left Joystick: X = Turn, Y = Drive
+                let turnX = gp.axes[0] !== undefined ? gp.axes[0] * 100 : 0;
+                let driveY = gp.axes[1] !== undefined ? -gp.axes[1] * 100 : 0; // Inverted Y for FWD positive
+
+                // Right Joystick: X = Strafe
+                let strafeX = gp.axes[2] !== undefined ? gp.axes[2] * 100 : (gp.axes[3] !== undefined ? gp.axes[3] * 100 : 0);
+
+                // Apply Deadzones (10%)
+                if (Math.abs(turnX) < 10) turnX = 0;
+                if (Math.abs(driveY) < 10) driveY = 0;
+                if (Math.abs(strafeX) < 10) strafeX = 0;
+
+                // Fallback D-Pad Controls
+                if (pressed.includes(12)) driveY = 100;   // D-Pad Up
+                if (pressed.includes(13)) driveY = -100;  // D-Pad Down
+                if (pressed.includes(14)) strafeX = -100; // D-Pad Left (Strafe Left)
+                if (pressed.includes(15)) strafeX = 100;  // D-Pad Right (Strafe Right)
+
+                let now = Date.now();
+                if (now - lastDriveSend > 50) {
+                    lastDriveSend = now;
+                    sendJoystickState(strafeX, driveY, turnX);
+                }
+
+                document.getElementById("debug").innerText = "Turn X (Left): " + Math.round(turnX) + " | Drive Y (Left): " + Math.round(driveY) + " | Strafe X (Right): " + Math.round(strafeX);
+            }
+
+            requestAnimationFrame(checkGamepad);
+        }
+
+        initWebSocket();
+        checkGamepad();
+    </script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 5. ASYNC SERVER & MOTOR WATCHDOG
+# ==========================================
+async def handle_client(reader, writer):
+    try:
+        request_line = await reader.readline()
+        if not request_line:
+            return
+            
+        req = request_line.decode('utf-8')
+        headers = {}
+        
+        while True:
+            line = await reader.readline()
+            if line == b'\r\n' or line == b'':
+                break
+            parts = line.decode('utf-8').split(':', 1)
+            if len(parts) == 2:
+                headers[parts[0].strip().lower()] = parts[1].strip()
+
+        path = req.split(' ')[1].split('?')[0] if len(req.split(' ')) > 1 else ''
+
+        # WebSocket Upgrade Endpoint
+        if path == '/ws' and 'sec-websocket-key' in headers:
+            handshake = generate_ws_handshake(headers['sec-websocket-key'])
+            writer.write(handshake.encode('utf-8'))
+            await writer.drain()
+            
+            while True:
+                msg = await read_ws_message(reader)
+                if not msg:
+                    break
+                
+                # Single-byte Servo Command
+                if len(msg) == 1:
+                    cmd = msg[0]
+                    if cmd == 1: await apply_position('1')
+                    elif cmd == 2: await apply_position('2')
+                    elif cmd == 22: await apply_position('22')
+                    elif cmd == 3: await apply_position('3')
+                    elif cmd == 33: await apply_position('33')
+                    elif cmd == 4: await apply_position('4')
+                    elif cmd == 44: await apply_position('44')
+                    elif cmd == 105: await apply_position('i')
+                    elif cmd == 106: await apply_position('ii')
+                    elif cmd == 5: await apply_position('5')
+
+                # 4-byte Mecanum Drive Packet [0x01, Strafe_X, Drive_Y, Turn_X]
+                elif len(msg) >= 4 and msg[0] == 0x01:
+                    strafe_x, drive_y, turn_x = ustruct.unpack('bbb', msg[1:4])
+                    apply_mecanum_drive(strafe_x, drive_y, turn_x)
+
+        # Serve Static Webpage
+        else:
+            writer.write("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n" + HTML_PAGE)
+            await writer.drain()
+            await writer.wait_closed()
+
+    except Exception:
+        pass
+
+async def motor_watchdog():
+    global motor_is_running
+    while True:
+        if motor_is_running and time.ticks_diff(time.ticks_ms(), last_drive_packet) > 400:
+            stop_motors()
+            motor_is_running = False
+            
+        gc.collect()
+        await asyncio.sleep_ms(100)
+
+async def main():
+    print("Starting WebSocket Mecanum Server...")
+    asyncio.create_task(motor_watchdog())
+    server = await asyncio.start_server(handle_client, "0.0.0.0", 80)
+    
+    while True:
+        await asyncio.sleep(3600)
+
+try:
+    asyncio.run(main())
+except KeyboardInterrupt:
+    stop_motors()
+    print("Server stopped.")
